@@ -1,0 +1,755 @@
+# ============================================================
+# Bootstrap 2 estágios para WLS V1:
+# (1) reamostra base estratificado por tratamento
+# (2) reestima propensity score dentro da amostra bootstrap (CV out-of-fold)
+# (3) refaz matching
+# (4) monta base matched + pesos ATT
+# (5) roda WLS V1 e guarda distribuição dos coeficientes + IC percentil
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
+import matplotlib.pyplot as plt
+
+
+# ---------- Helper: construir base "matched" + pesos ATT a partir dos pares ----------
+def build_matched_att_from_pairs(
+    df: pd.DataFrame,
+    pairs: pd.DataFrame,
+    *,
+    id_col: str = "id",
+    treat_col: str = "tratamento",
+    outcome_col: str = "desfecho",
+    treated_id_col: str = "treated_id",
+    control_id_col: str = "control_id",
+    k: int = 1,
+    weight_scheme: str = "equal",   # "equal" = cada tratado contribui 1; se k>1, cada par pesa 1/k
+    weight_col_out: str = "w_match",
+):
+    df0 = df.copy()
+
+    if id_col not in df0.columns:
+        df0 = df0.reset_index(drop=True)
+        df0[id_col] = np.arange(len(df0))
+
+    pairs0 = pairs.copy()
+    pairs0[treated_id_col] = pairs0[treated_id_col].astype(int)
+    pairs0[control_id_col] = pairs0[control_id_col].astype(int)
+
+    treated_ids = pairs0[treated_id_col].unique()
+    control_ids = pairs0[control_id_col].unique()
+
+    df_t = df0[df0[id_col].isin(treated_ids)].copy()
+    df_c = df0[df0[id_col].isin(control_ids)].copy()
+
+    if weight_scheme == "equal":
+        pair_w = 1.0 / float(k)
+    else:
+        raise ValueError(f"weight_scheme desconhecido: {weight_scheme}")
+
+    # peso do controle = soma dos pesos dos pares em que ele aparece
+    control_w = pairs0.groupby(control_id_col).size().rename("n_used").to_frame()
+    control_w[weight_col_out] = control_w["n_used"] * pair_w
+
+    # peso do tratado = 1
+    df_t[weight_col_out] = 1.0
+
+    # aplica aos controles
+    df_c = df_c.merge(
+        control_w[[weight_col_out]],
+        left_on=id_col,
+        right_index=True,
+        how="left",
+    )
+    df_c[weight_col_out] = df_c[weight_col_out].fillna(0.0)
+
+    df_matched = pd.concat([df_t, df_c], axis=0, ignore_index=True)
+
+    if outcome_col not in df_matched.columns:
+        raise ValueError(f"outcome_col='{outcome_col}' não está no dataframe.")
+    if treat_col not in df_matched.columns:
+        raise ValueError(f"treat_col='{treat_col}' não está no dataframe.")
+
+    return df_matched
+
+
+# ---------- Helper: roda WLS V1 (robust HC3) ----------
+def run_wls_v1(
+    df: pd.DataFrame,
+    *,
+    formula: str,
+    weight_col: str | None = "w_match",
+    robust_cov: str = "HC3",
+):
+    if weight_col is None:
+        res = smf.ols(formula=formula, data=df).fit(cov_type=robust_cov)
+        return res
+
+    w = df[weight_col].astype(float).values
+    res = smf.wls(formula=formula, data=df, weights=w).fit(cov_type=robust_cov)
+    return res
+
+
+# ============================================================
+# PRINCIPAL: Bootstrap 2 estágios (PS-aware + matching-aware) para WLS V1
+# ============================================================
+def bootstrap_wls_v1_2stage(
+    df_base: pd.DataFrame,
+    *,
+    # colunas
+    id_col: str = "id",
+    treat_col: str = "tratamento",
+    outcome_col: str = "desfecho",
+    ps_col: str = "propensity_score",
+
+    # PS (2º estágio) - precisa existir no notebook: estimar_propensity_score(...)
+    covariates: list | None = None,
+    ps_n_splits: int = 5,
+
+    # matching
+    k: int = 1,
+    with_replacement: bool = True,
+    use_logit: bool = True,
+    caliper: float | None = 0.2,
+    caliper_scale: str = "sd",
+    require_full_match: bool = True,
+    strata_cols: list[str] | None = None,
+    weight_scheme: str = "equal",
+
+    # WLS V1
+    formula: str = "desfecho ~ tratamento",
+    robust_cov: str = "HC3",
+
+    # bootstrap
+    n_boot: int = 500,
+    alpha: float = 0.05,
+    random_state: int = 42,
+    min_valid: int = 50,
+
+    # quais coeficientes acompanhar (None = todos)
+    coef_names: list[str] | None = None,
+
+    # opcional: gráficos
+    make_plots: bool = True,
+):
+    """
+    Retorna:
+      coef_df: DataFrame com coeficientes por réplica bootstrap (apenas válidas)
+      summary_df: média, desvio e IC percentil (1-alpha) para cada coeficiente
+    """
+
+    rng = np.random.default_rng(random_state)
+
+    df0 = df_base.copy()
+    if df0.index.has_duplicates:
+        df0 = df0.reset_index(drop=True)
+
+    # garante id
+    if id_col not in df0.columns:
+        df0[id_col] = np.arange(len(df0))
+
+    treated0 = df0[df0[treat_col] == 1].copy()
+    control0 = df0[df0[treat_col] == 0].copy()
+    n_t, n_c = len(treated0), len(control0)
+
+    if n_t == 0 or n_c == 0:
+        raise ValueError("Precisa haver tratados e controles em df_base.")
+
+    boot_params = []
+    valid = 0
+
+    for b in range(n_boot):
+        # 1) reamostra estratificado (mantém n_t e n_c)
+        t_b = treated0.sample(n=n_t, replace=True, random_state=int(rng.integers(0, 2**31 - 1)))
+        c_b = control0.sample(n=n_c, replace=True, random_state=int(rng.integers(0, 2**31 - 1)))
+        df_b = pd.concat([t_b, c_b], axis=0).reset_index(drop=True)
+
+        try:
+            # 2) reestima PS dentro da amostra bootstrap (CV out-of-fold)
+            df_b_ps = estimar_propensity_score(
+                df_b,
+                treat_col=treat_col,
+                covariates=covariates,
+                n_splits=ps_n_splits,
+                seed=int(rng.integers(0, 2**31 - 1)),
+            )
+
+            # id único na amostra bootstrap (crítico!)
+            df_b_ps[id_col] = np.arange(len(df_b_ps))
+            df_b_ps = df_b_ps.set_index(id_col, drop=False)
+
+            # 3) refaz matching
+            pairs_b, _ = propensity_score_matching(
+                df_b_ps,
+                treat_col=treat_col,
+                ps_col=ps_col,
+                k=k,
+                with_replacement=with_replacement,
+                use_logit=use_logit,
+                caliper=caliper,
+                caliper_scale=caliper_scale,
+                require_full_match=require_full_match,
+                seed=int(rng.integers(0, 2**31 - 1)),
+                strata_cols=strata_cols,
+            )
+            if pairs_b is None or len(pairs_b) == 0:
+                continue
+
+            # 4) monta matched sample + pesos ATT
+            df_matched_b = build_matched_att_from_pairs(
+                df_b_ps,
+                pairs_b,
+                id_col=id_col,
+                treat_col=treat_col,
+                outcome_col=outcome_col,
+                treated_id_col="treated_id",
+                control_id_col="control_id",
+                k=k,
+                weight_scheme=weight_scheme,
+                weight_col_out="w_match",
+            )
+
+            # remove pesos zero
+            df_matched_b = df_matched_b[df_matched_b["w_match"] > 0].copy()
+
+            # 5) roda WLS V1
+            res_b = run_wls_v1(
+                df_matched_b,
+                formula=formula,
+                weight_col="w_match",
+                robust_cov=robust_cov,
+            )
+
+            params_b = res_b.params.copy()
+            if coef_names is not None:
+                params_b = params_b.reindex(coef_names)
+
+            boot_params.append(params_b)
+            valid += 1
+
+        except Exception:
+            continue
+
+    if valid < min_valid:
+        raise ValueError(
+            f"Poucas réplicas válidas: {valid}/{n_boot}. "
+            "Sugestões: afrouxe caliper, use with_replacement=True, reduza k, "
+            "ou use require_full_match=False."
+        )
+
+    coef_df = pd.DataFrame(boot_params)
+
+    # resumo com IC percentil
+    q_low = alpha / 2
+    q_high = 1 - alpha / 2
+
+    summary = []
+    for col in coef_df.columns:
+        s = coef_df[col].dropna()
+        if s.shape[0] == 0:
+            continue
+        summary.append({
+            "coef": col,
+            "n": int(s.shape[0]),
+            "mean": float(s.mean()),
+            "std": float(s.std(ddof=1)) if s.shape[0] > 1 else np.nan,
+            f"p{100*q_low:.1f}": float(np.quantile(s, q_low)),
+            "p50": float(np.quantile(s, 0.50)),
+            f"p{100*q_high:.1f}": float(np.quantile(s, q_high)),
+        })
+    summary_df = pd.DataFrame(summary).sort_values("coef").reset_index(drop=True)
+
+    # plots
+    if make_plots:
+        for col in coef_df.columns:
+            s = coef_df[col].dropna()
+            if s.shape[0] == 0:
+                continue
+            plt.figure()
+            plt.hist(s.values, bins=30)
+            plt.title(f"Bootstrap 2-stage: distribuição do coeficiente '{col}'")
+            plt.xlabel("coeficiente")
+            plt.ylabel("frequência")
+            plt.show()
+
+    return coef_df, summary_df
+
+
+# ============================================================
+# EXEMPLO DE USO
+# ============================================================
+# formula_v1 = "desfecho ~ tratamento + x_cont1 + x_cont2 + C(x_cat1) + C(x_cat2)"
+#
+# coef_df, summary_df = bootstrap_wls_v1_2stage(
+#     df_base,                        # dataframe ANTES do PS
+#     treat_col="tratamento",
+#     outcome_col="desfecho",
+#     covariates=["x_cont1","x_cont2","x_cont3","x_disc1","x_disc2","x_cat1","x_cat2"],
+#     ps_n_splits=5,
+#     k=1,
+#     with_replacement=True,
+#     caliper=0.2,
+#     caliper_scale="sd",
+#     require_full_match=True,
+#     formula=formula_v1,
+#     robust_cov="HC3",
+#     n_boot=500,
+#     alpha=0.05,
+#     random_state=42,
+#     coef_names=["tratamento", "x_cont1", "x_cont2"],  # opcional
+#     make_plots=True,
+# )
+#
+# print(summary_df)
+
+
+
+# ============================================================
+# BLOCO FINAL — Scanner robusto de heterogeneidade (ATT / "impacto nos tratados")
+# Bootstrap 2-estágios: reamostra -> reestima PS -> rematching -> WLS V1
+#
+# Objetivo:
+#   Encontrar variáveis (moderadores) e "valores" onde o efeito nos tratados é maior,
+#   MAS só reportar se o achado for robusto (consistência de sinal + IC bootstrap).
+#
+# Requisitos:
+#   - Você já tem no notebook: estimar_propensity_score(...) e propensity_score_matching(...)
+#   - Você já está usando o pipeline de matching + pesos ATT (w_match)
+#
+# Saídas:
+#   - summary_df: tabela ranqueada com achados robustos (ou vazia se nada robusto)
+#   - details: dicionário com distribuições bootstrap por variável (para auditoria)
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
+
+
+# ---------- Helper: montar base matched + pesos ATT (igual ao que já usamos) ----------
+def build_matched_att_from_pairs(
+    df: pd.DataFrame,
+    pairs: pd.DataFrame,
+    *,
+    id_col: str = "id",
+    treat_col: str = "tratamento",
+    treated_id_col: str = "treated_id",
+    control_id_col: str = "control_id",
+    k: int = 1,
+    weight_scheme: str = "equal",
+    weight_col_out: str = "w_match",
+):
+    df0 = df.copy()
+    if id_col not in df0.columns:
+        df0 = df0.reset_index(drop=True)
+        df0[id_col] = np.arange(len(df0))
+
+    pairs0 = pairs.copy()
+    pairs0[treated_id_col] = pairs0[treated_id_col].astype(int)
+    pairs0[control_id_col] = pairs0[control_id_col].astype(int)
+
+    treated_ids = pairs0[treated_id_col].unique()
+    control_ids = pairs0[control_id_col].unique()
+
+    df_t = df0[df0[id_col].isin(treated_ids)].copy()
+    df_c = df0[df0[id_col].isin(control_ids)].copy()
+
+    if weight_scheme == "equal":
+        pair_w = 1.0 / float(k)
+    else:
+        raise ValueError(f"weight_scheme desconhecido: {weight_scheme}")
+
+    # controles: peso = (# vezes usado) * (1/k)
+    control_w = pairs0.groupby(control_id_col).size().rename("n_used").to_frame()
+    control_w[weight_col_out] = control_w["n_used"] * pair_w
+
+    # tratados: peso 1
+    df_t[weight_col_out] = 1.0
+
+    df_c = df_c.merge(control_w[[weight_col_out]], left_on=id_col, right_index=True, how="left")
+    df_c[weight_col_out] = df_c[weight_col_out].fillna(0.0)
+
+    df_m = pd.concat([df_t, df_c], axis=0, ignore_index=True)
+    df_m = df_m[df_m[weight_col_out] > 0].copy()
+    return df_m
+
+
+# ---------- Helper: roda WLS V1 com robust ----------
+def fit_wls_v1(df, formula, weight_col="w_match", robust_cov="HC3"):
+    w = df[weight_col].astype(float).values
+    return smf.wls(formula=formula, data=df, weights=w).fit(cov_type=robust_cov)
+
+
+# ---------- Helper: BH-FDR (Benjamini-Hochberg) ----------
+def bh_fdr(pvals: pd.Series) -> pd.Series:
+    p = pvals.astype(float).values
+    n = len(p)
+    order = np.argsort(p)
+    ranked = p[order]
+    q = np.empty(n, dtype=float)
+    prev = 1.0
+    for i in range(n - 1, -1, -1):
+        rank = i + 1
+        val = ranked[i] * n / rank
+        prev = min(prev, val)
+        q[i] = prev
+    out = np.empty(n, dtype=float)
+    out[order] = q
+    return pd.Series(out, index=pvals.index)
+
+
+# ============================================================
+# Função principal: scan de heterogeneidade robusta (2-estágios)
+# ============================================================
+def robust_heterogeneity_scan_wls_v1_2stage(
+    df_base: pd.DataFrame,
+    *,
+    # colunas
+    treat_col: str = "tratamento",
+    outcome_col: str = "desfecho",
+    id_col: str = "id",
+    ps_col: str = "propensity_score",
+
+    # PS (2º estágio): usa sua função estimar_propensity_score(...)
+    covariates_ps: list[str],
+    ps_n_splits: int = 5,
+
+    # matching
+    k: int = 1,
+    with_replacement: bool = True,
+    use_logit: bool = True,
+    caliper: float | None = 0.2,
+    caliper_scale: str = "sd",
+    require_full_match: bool = True,
+    strata_cols: list[str] | None = None,
+    weight_scheme: str = "equal",
+
+    # Modelo WLS V1 base (controles sempre incluídos)
+    # Exemplo: "x_cont1 + x_cont2 + C(x_cat1) + C(x_cat2)"
+    controls_rhs: str = "",
+
+    # moderadores a investigar (heterogeneidade)
+    moderators: list[str] = None,
+
+    # tipo do moderador:
+    # - se estiver em cat_cols => trata como categórico: usa C(var) e interações por nível
+    # - senão => trata como numérico contínuo (padroniza dentro de cada réplica)
+    cat_cols: list[str] | None = None,
+
+    # robustez / filtros
+    n_boot: int = 400,
+    alpha: float = 0.05,
+    robust_cov: str = "HC3",
+    min_valid: int = 120,              # nº mínimo de réplicas válidas por moderador
+    min_group_treated: int = 80,        # garante suporte para "alto vs baixo" nos tratados
+    sign_consistency_min: float = 0.90, # % de réplicas com mesmo sinal (para ser robusto)
+    fdr_q: float = 0.10,                # controle de múltiplos testes (BH)
+    min_effect_practical: float = 0.0,  # opcional: exigir magnitude mínima no "gap" alto-baixo
+
+    # valores "alto vs baixo" (contínuo)
+    quant_low: float = 0.25,
+    quant_high: float = 0.75,
+
+    random_state: int = 42,
+):
+    """
+    Como mede heterogeneidade (foco em tratados / ATT):
+      - Para moderadores CONTÍNUOS:
+          roda y ~ T + Z + T:Z + controles (Z padronizado)
+          e transforma em "efeito alto - efeito baixo" nos tratados:
+              gap = beta_T:Z * (z_high - z_low)
+          (z_high/z_low são quantis dentro dos TRATADOS da réplica bootstrap)
+      - Para moderadores CATEGÓRICOS:
+          roda y ~ T + C(M) + T:C(M) + controles
+          e avalia a maior diferença de efeito entre níveis vs referência.
+          Reporta qual nível maximiza o efeito.
+
+    Robustez (só reporta se):
+      - réplicas válidas >= min_valid
+      - IC (percentil) do "gap" exclui 0
+      - consistência de sinal >= sign_consistency_min
+      - passa BH-FDR (q <= fdr_q)
+    """
+
+    if moderators is None or len(moderators) == 0:
+        raise ValueError("Passe uma lista de moderators=[...] para o scan.")
+    if cat_cols is None:
+        cat_cols = []
+
+    rng = np.random.default_rng(random_state)
+
+    df0 = df_base.copy()
+    if df0.index.has_duplicates:
+        df0 = df0.reset_index(drop=True)
+    if id_col not in df0.columns:
+        df0[id_col] = np.arange(len(df0))
+
+    # Amostragem estratificada por tratamento (mantém proporção)
+    treated0 = df0[df0[treat_col] == 1].copy()
+    control0 = df0[df0[treat_col] == 0].copy()
+    n_t, n_c = len(treated0), len(control0)
+    if n_t == 0 or n_c == 0:
+        raise ValueError("Precisa haver tratados e controles em df_base.")
+
+    # Armazenamento por moderador
+    details = {m: {"gap": [], "best_label": []} for m in moderators}
+
+    # Bootstrap principal (gera réplicas e para cada réplica roda o modelo de cada moderador)
+    for b in range(n_boot):
+        # 1) reamostra estratificado
+        t_b = treated0.sample(n=n_t, replace=True, random_state=int(rng.integers(0, 2**31 - 1)))
+        c_b = control0.sample(n=n_c, replace=True, random_state=int(rng.integers(0, 2**31 - 1)))
+        df_b = pd.concat([t_b, c_b], axis=0).reset_index(drop=True)
+
+        try:
+            # 2) reestima PS (2º estágio)
+            df_b_ps = estimar_propensity_score(
+                df_b,
+                treat_col=treat_col,
+                covariates=covariates_ps,
+                n_splits=ps_n_splits,
+                seed=int(rng.integers(0, 2**31 - 1)),
+            )
+
+            # id único dentro da réplica (crítico!)
+            df_b_ps[id_col] = np.arange(len(df_b_ps))
+            df_b_ps = df_b_ps.set_index(id_col, drop=False)
+
+            # 3) rematching
+            pairs_b, _ = propensity_score_matching(
+                df_b_ps,
+                treat_col=treat_col,
+                ps_col=ps_col,
+                k=k,
+                with_replacement=with_replacement,
+                use_logit=use_logit,
+                caliper=caliper,
+                caliper_scale=caliper_scale,
+                require_full_match=require_full_match,
+                seed=int(rng.integers(0, 2**31 - 1)),
+                strata_cols=strata_cols,
+            )
+            if pairs_b is None or len(pairs_b) == 0:
+                continue
+
+            # 4) base matched + pesos ATT
+            df_m = build_matched_att_from_pairs(
+                df_b_ps,
+                pairs_b,
+                id_col=id_col,
+                treat_col=treat_col,
+                k=k,
+                weight_scheme=weight_scheme,
+                weight_col_out="w_match",
+            )
+
+            # para garantir "alto vs baixo" nos tratados, checa contagem mínima
+            df_m_t = df_m[df_m[treat_col] == 1]
+            if len(df_m_t) < min_group_treated:
+                continue
+
+            # 5) para cada moderador, estima heterogeneidade
+            for m in moderators:
+                if m not in df_m.columns:
+                    continue
+
+                # monta RHS de controles
+                base_controls = controls_rhs.strip()
+                if base_controls != "":
+                    base_controls = " + " + base_controls
+
+                if m in cat_cols:
+                    # categórico: interação por nível via C(m)
+                    # formula: y ~ T + C(m) + T:C(m) + controles
+                    formula = f"{outcome_col} ~ {treat_col} + C({m}) + {treat_col}:C({m}){base_controls}"
+                    res = fit_wls_v1(df_m, formula=formula, weight_col="w_match", robust_cov=robust_cov)
+
+                    # efeito por nível = beta_T + beta_T:C(m)[T.level]  (ref tem interação = 0)
+                    beta_T = res.params.get(treat_col, np.nan)
+
+                    # encontra níveis presentes
+                    levels = sorted(df_m[m].dropna().unique().tolist())
+                    if len(levels) < 2:
+                        continue
+
+                    # calcula efeito por nível e pega o melhor (max) vs pior (min)
+                    eff = {}
+                    eff[f"ref({levels[0]})"] = float(beta_T)  # referência depende do patsy; aqui usamos label só para leitura
+                    # pega nomes reais dos termos de interação que o statsmodels criou
+                    # ex: tratamento:C(m)[T.B]
+                    for term, val in res.params.items():
+                        if term.startswith(f"{treat_col}:C({m})"):
+                            # extrai label do nível
+                            eff[term] = float(beta_T + val)
+
+                    # também inclui qualquer nível não aparecendo explicitamente (fica como beta_T)
+                    # (isso cobre a referência, mas também casos onde só um nível aparece em bootstrap)
+                    eff_values = list(eff.items())
+                    if len(eff_values) < 2:
+                        continue
+
+                    best_term, best_eff = max(eff_values, key=lambda kv: kv[1])
+                    worst_term, worst_eff = min(eff_values, key=lambda kv: kv[1])
+
+                    gap = best_eff - worst_eff  # "quanto o efeito varia entre níveis"
+                    details[m]["gap"].append(gap)
+                    details[m]["best_label"].append(best_term)
+
+                else:
+                    # contínuo: padroniza dentro da réplica (evita escala arbitrária)
+                    x = df_m[m].astype(float)
+                    mu = float(x.mean())
+                    sd = float(x.std(ddof=0))
+                    if not np.isfinite(sd) or sd <= 1e-12:
+                        continue
+                    df_m["_Z_"] = (x - mu) / sd
+
+                    # quantis calculados DENTRO DOS TRATADOS da réplica (foco "impacto nos tratados")
+                    z_t = df_m.loc[df_m[treat_col] == 1, "_Z_"]
+                    z_low = float(z_t.quantile(quant_low))
+                    z_high = float(z_t.quantile(quant_high))
+                    if not (np.isfinite(z_low) and np.isfinite(z_high)) or (z_high - z_low) <= 1e-9:
+                        continue
+
+                    # formula: y ~ T + Z + T:Z + controles
+                    formula = f"{outcome_col} ~ {treat_col} + _Z_ + {treat_col}:_Z_{base_controls}"
+                    res = fit_wls_v1(df_m, formula=formula, weight_col="w_match", robust_cov=robust_cov)
+
+                    beta_int = res.params.get(f"{treat_col}:_Z_", np.nan)
+                    if not np.isfinite(beta_int):
+                        continue
+
+                    # gap (alto - baixo) no ATT entre tratados: Δ = beta_int*(z_high - z_low)
+                    gap = float(beta_int * (z_high - z_low))
+                    details[m]["gap"].append(gap)
+                    details[m]["best_label"].append(f"high={quant_high:.2f} vs low={quant_low:.2f} (nos tratados)")
+
+        except Exception:
+            continue
+
+    # =======================
+    # Consolidar robustez
+    # =======================
+    rows = []
+    for m in moderators:
+        gaps = np.array(details[m]["gap"], dtype=float)
+        gaps = gaps[np.isfinite(gaps)]
+        n_valid = gaps.size
+        if n_valid < min_valid:
+            continue
+
+        # IC percentil do gap (heterogeneidade)
+        lo = float(np.quantile(gaps, alpha / 2))
+        hi = float(np.quantile(gaps, 1 - alpha / 2))
+        med = float(np.quantile(gaps, 0.50))
+        mean = float(gaps.mean())
+
+        # consistência de sinal (robustez)
+        sign = np.sign(med) if med != 0 else 0.0
+        if sign == 0:
+            sign_cons = float((gaps == 0).mean())
+        else:
+            sign_cons = float((np.sign(gaps) == sign).mean())
+
+        # p-valor bootstrap simples (bicaudal) via "tail probability"
+        # p = 2 * min(P(gap<=0), P(gap>=0))
+        p_left = float((gaps <= 0).mean())
+        p_right = float((gaps >= 0).mean())
+        p_boot = 2.0 * min(p_left, p_right)
+        p_boot = min(max(p_boot, 0.0), 1.0)
+
+        robust_sign = (sign_cons >= sign_consistency_min)
+        robust_ci = (lo > 0) or (hi < 0)
+        robust_practical = abs(med) >= float(min_effect_practical)
+
+        # label do "onde é maior" (para cat: nível; para cont: high vs low)
+        # (pega o mais frequente dentre réplicas)
+        labels = details[m]["best_label"]
+        label = pd.Series(labels).value_counts().index[0] if len(labels) else ""
+
+        rows.append({
+            "moderator": m,
+            "n_valid": int(n_valid),
+            "gap_mean": mean,
+            "gap_median": med,
+            f"gap_p{100*alpha/2:.1f}": lo,
+            f"gap_p{100*(1-alpha/2):.1f}": hi,
+            "sign_consistency": sign_cons,
+            "p_boot": p_boot,
+            "where_effect_is_higher": label,
+            "robust_ci": bool(robust_ci),
+            "robust_sign": bool(robust_sign),
+            "robust_practical": bool(robust_practical),
+        })
+
+    if len(rows) == 0:
+        summary_df = pd.DataFrame(columns=[
+            "moderator","n_valid","gap_mean","gap_median",
+            f"gap_p{100*alpha/2:.1f}", f"gap_p{100*(1-alpha/2):.1f}",
+            "sign_consistency","p_boot","q_fdr","where_effect_is_higher",
+            "robust"
+        ])
+        return summary_df, details
+
+    summary_df = pd.DataFrame(rows)
+
+    # FDR (múltiplos testes)
+    summary_df["q_fdr"] = bh_fdr(summary_df["p_boot"])
+
+    # regra final de robustez
+    summary_df["robust"] = (
+        summary_df["robust_ci"]
+        & summary_df["robust_sign"]
+        & summary_df["robust_practical"]
+        & (summary_df["q_fdr"] <= float(fdr_q))
+    )
+
+    # ranqueia: primeiro robustos, depois maior |mediana|
+    summary_df = summary_df.sort_values(
+        by=["robust", "gap_median"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    # opcional: retorna só achados robustos (você pode comentar esta linha se quiser ver tudo)
+    summary_df = summary_df[summary_df["robust"]].reset_index(drop=True)
+
+    return summary_df, details
+
+
+# ============================================================
+# EXEMPLO DE USO (ajuste nomes conforme seu notebook)
+# ============================================================
+# moderators = ["x_cont1", "x_cont2", "x_disc1", "x_cat1", "x_cat2"]
+# cat_cols = ["x_cat1", "x_cat2"]
+#
+# summary_df, details = robust_heterogeneity_scan_wls_v1_2stage(
+#     df_base,  # dataframe ANTES de propensity_score
+#     treat_col="tratamento",
+#     outcome_col="desfecho",
+#     covariates_ps=["x_cont1","x_cont2","x_cont3","x_disc1","x_disc2","x_cat1","x_cat2"],
+#     ps_n_splits=5,
+#     k=1,
+#     with_replacement=True,
+#     caliper=0.2,
+#     caliper_scale="sd",
+#     require_full_match=True,
+#     controls_rhs="x_cont1 + x_cont2 + x_cont3 + x_disc1 + x_disc2 + C(x_cat1) + C(x_cat2)",
+#     moderators=moderators,
+#     cat_cols=cat_cols,
+#     n_boot=400,
+#     alpha=0.05,
+#     sign_consistency_min=0.90,
+#     fdr_q=0.10,
+#     min_valid=120,
+#     min_group_treated=80,
+#     min_effect_practical=0.0,  # se quiser, exija uma magnitude mínima (ex: 0.02)
+#     random_state=42,
+# )
+#
+# print(summary_df)
+#
+# # Se quiser inspecionar distribuição de um moderador específico:
+# # m = "x_cont2"
+# # gaps = np.array(details[m]["gap"], dtype=float)
+# # print(np.quantile(gaps[np.isfinite(gaps)], [0.025, 0.5, 0.975]))
